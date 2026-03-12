@@ -1,0 +1,1365 @@
+#!/usr/bin/env python3
+"""codex-chats: Interactive browser for Codex CLI sessions."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import shlex
+import subprocess
+import sys
+import tempfile
+import threading
+import urllib.error
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from pathlib import Path
+
+if sys.version_info < (3, 7):
+    print("Error: Python 3.7+ required")
+    sys.exit(1)
+
+SESSION_ROOT = Path.home() / ".codex" / "sessions"
+CONFIG_FILE = Path.home() / ".codex" / "codex-chats.json"
+SUMMARY_CACHE = Path.home() / ".codex" / "codex-chats-summaries.json"
+GEMINI_KEY_FILE = Path.home() / ".gemini_api_key"
+TITLES_FILE = Path.home() / ".codex" / "codex-chats-titles.json"
+
+IS_WINDOWS = sys.platform == "win32"
+
+# ANSI
+DIM = "\033[2m"
+BOLD = "\033[1m"
+CYAN = "\033[36m"
+GREEN = "\033[32m"
+RED = "\033[31m"
+YELLOW = "\033[33m"
+MAGENTA = "\033[35m"
+RESET = "\033[0m"
+
+FZF_COLORS = ",".join([
+    "fg:#c0caf5",
+    "bg:#1a1b26",
+    "hl:#bb9af7",
+    "fg+:#c0caf5",
+    "bg+:#292e42",
+    "hl+:#7dcfff",
+    "info:#7aa2f7",
+    "prompt:#7dcfff",
+    "pointer:#ff007c",
+    "marker:#9ece6a",
+    "spinner:#9ece6a",
+    "header:#565f89",
+    "border:#27a1b9",
+    "gutter:#1a1b26",
+])
+
+ANSI_RE = re.compile(r"\033\[[^m]*m")
+XML_TAG_RE = re.compile(r"<[^>]+>")
+SESSION_ID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$")
+
+SYSTEM_TAGS = [
+    "AGENTS.md instructions",
+    "<INSTRUCTIONS>",
+    "<permissions instructions>",
+    "<collaboration_mode>",
+    "<model_switch>",
+    "<environment_context>",
+    "<turn_aborted>",
+    "<local-command-",
+    "<command-name>",
+    "<system-reminder>",
+]
+
+
+# ── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _is_wsl() -> bool:
+    try:
+        with open("/proc/version", "r") as f:
+            return "microsoft" in f.read().lower()
+    except (FileNotFoundError, PermissionError):
+        return False
+
+
+def clear_screen() -> None:
+    if IS_WINDOWS:
+        os.system("cls")
+    else:
+        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.flush()
+
+
+def term_width() -> int:
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return 80
+
+
+def is_compact() -> bool:
+    return term_width() < 100
+
+
+def strip_ansi(s: str) -> str:
+    return ANSI_RE.sub("", s)
+
+
+def _wrap_header(parts: list[str], max_width: int, indent: str = "  ") -> list[str]:
+    lines: list[str] = []
+    current = ""
+    for part in parts:
+        candidate = f"{current} {part}".strip() if current else part
+        if len(strip_ansi(candidate)) > max_width and current:
+            lines.append(indent + current)
+            current = part
+        else:
+            current = candidate
+    if current:
+        lines.append(indent + current)
+    return lines
+
+
+def _is_system_text(text: str) -> bool:
+    if not text:
+        return True
+    for tag in SYSTEM_TAGS:
+        if tag in text:
+            return True
+    return False
+
+
+def _fzf_version() -> float:
+    try:
+        out = subprocess.check_output(["fzf", "--version"], encoding="utf-8", errors="replace")
+        m = re.match(r"(\d+\.\d+)", out.strip())
+        return float(m.group(1)) if m else 0.0
+    except Exception:
+        return 0.0
+
+
+FZF_VER = _fzf_version()
+
+SORT_MODES = ["name", "chats", "recent"]
+SORT_LABELS = {"name": "A-Z", "chats": "Most chats", "recent": "Recent"}
+CHAT_SORT_MODES = ["recent"]
+CHAT_SORT_LABELS = {"recent": "Recent"}
+
+
+# ── Config + summaries ───────────────────────────────────────────────────
+
+
+def load_config() -> dict:
+    try:
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f)
+
+
+def _build_cmd(base: list[str], cfg: dict) -> list[str]:
+    cmd = list(base)
+    if cfg.get("unsafe_mode"):
+        cmd.append("--dangerously-bypass-approvals-and-sandbox")
+    return cmd
+
+
+def _confirm_enable_unsafe() -> bool:
+    return True
+
+
+def load_summaries() -> dict:
+    try:
+        with open(SUMMARY_CACHE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_summaries(cache: dict) -> None:
+    SUMMARY_CACHE.parent.mkdir(parents=True, exist_ok=True)
+    with open(SUMMARY_CACHE, "w") as f:
+        json.dump(cache, f)
+
+
+def load_titles() -> dict:
+    try:
+        with open(TITLES_FILE, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_titles(titles: dict) -> None:
+    TITLES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(TITLES_FILE, "w") as f:
+        json.dump(titles, f)
+
+
+def load_gemini_key() -> str | None:
+    try:
+        return GEMINI_KEY_FILE.read_text().strip()
+    except FileNotFoundError:
+        return None
+
+
+def prompt_gemini_key() -> str | None:
+    print(f"\n  {BOLD}Paste Gemini API key:{RESET} ", end="", flush=True)
+    key = input().strip()
+    if not key:
+        print(f"  {DIM}Cancelled.{RESET}")
+        return None
+    GEMINI_KEY_FILE.write_text(key + "\n")
+    print(f"  {GREEN}Key saved to {GEMINI_KEY_FILE}{RESET}\n")
+    return key
+
+
+def generate_summary(api_key: str, message: str) -> str | None:
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        "gemini-2.5-flash-lite:generateContent?key=" + api_key
+    )
+    payload = json.dumps({
+        "contents": [{"parts": [{"text":
+            "Summarize this chat message in 3-6 words. Just the topic, no fluff:\n\n" + message
+        }]}]
+    }).encode()
+    req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+        return data["candidates"][0]["content"]["parts"][0]["text"].strip().strip('"')
+    except Exception:
+        return None
+
+
+def generate_missing_summaries(api_key: str, chats: list[dict], cache: dict) -> dict:
+    missing = []
+    for chat in chats:
+        sid = chat.get("session_id") or ""
+        if sid and sid not in cache and chat["message"] not in ("(empty session)", "(resumed session)"):
+            missing.append((sid, chat["message"]))
+    if not missing:
+        return cache
+
+    total = len(missing)
+    done = [0]
+    lock = threading.Lock()
+
+    def _gen(item):
+        sid, msg = item
+        result = generate_summary(api_key, msg)
+        with lock:
+            done[0] += 1
+            count = done[0]
+        sys.stdout.write(f"\r  Summarizing {count}/{total}...")
+        sys.stdout.flush()
+        return sid, result
+
+    sys.stdout.write("\r  Summarizing 0/{}...".format(total))
+    sys.stdout.flush()
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for sid, result in pool.map(_gen, missing):
+            if result:
+                cache[sid] = result
+    sys.stdout.write("\r" + " " * 40 + "\r")
+    sys.stdout.flush()
+    save_summaries(cache)
+    return cache
+
+
+# ── FZF wrapper ───────────────────────────────────────────────────────────
+
+
+def fzf(lines, header, multi=False, prompt=" ", preview_cmd=None, expect_keys=None, border_label=None, start_index=None):
+    margin = "0,1" if is_compact() else "1,2"
+    border = "rounded" if FZF_VER >= 0.35 else "sharp"
+    info_style = "inline-right" if FZF_VER >= 0.39 else "inline"
+    args = [
+        "fzf",
+        "--header",
+        header,
+        "--header-first",
+        "--reverse",
+        "--no-sort",
+        "--prompt",
+        prompt,
+        "--pointer",
+        ">",
+        "--marker",
+        "*",
+        "--border",
+        border,
+        "--margin",
+        margin,
+        "--padding",
+        "0,1",
+        "--info",
+        info_style,
+        "--color",
+        FZF_COLORS,
+        "--ansi",
+        "--delimiter",
+        "\t",
+        "--with-nth",
+        "1",
+    ]
+    if FZF_VER >= 0.35:
+        args.extend(["--border-label-pos", "3"])
+        if border_label:
+            args.extend(["--border-label", f" {border_label} "])
+    binds = ["ctrl-a:select-all"]
+    if start_index and start_index > 1:
+        downs = "+".join(["down"] * (start_index - 1))
+        binds.append(f"start:{downs}")
+    if multi:
+        args.append("--multi")
+        binds.append("space:toggle+down")
+    if expect_keys:
+        args.extend(["--expect", ",".join(expect_keys)])
+    if start_index and start_index > 1:
+        args.append("--sync")
+    args.extend(["--bind", ",".join(binds)])
+    if preview_cmd:
+        if term_width() < 100:
+            preview_pos = "bottom:50%:wrap:border-top"
+        else:
+            preview_pos = "right:50%:wrap:border-left"
+        args.extend(["--preview", preview_cmd, "--preview-window", preview_pos])
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+        )
+        stdout, _ = proc.communicate(input="\n".join(lines))
+    except FileNotFoundError:
+        print("Error: fzf not found. Install with:")
+        print("  Ubuntu/Debian: sudo apt install fzf")
+        print("  macOS:         brew install fzf")
+        sys.exit(1)
+    if proc.returncode != 0:
+        if proc.returncode == 130:
+            raise KeyboardInterrupt
+        return "esc", None
+    if expect_keys:
+        out_lines = stdout.split("\n")
+        pressed = out_lines[0].strip()
+        selections = [l for l in out_lines[1:] if l.strip()]
+        return pressed, selections or None
+    selections = [l for l in stdout.strip().split("\n") if l.strip()]
+    return None, selections or None
+
+
+def fzf_rename(lines, header, preview_cmd=None, border_label=None, start_index=None, initial_query=""):
+    margin = "0,1" if is_compact() else "1,2"
+    border = "rounded" if FZF_VER >= 0.35 else "sharp"
+    info_style = "inline-right" if FZF_VER >= 0.39 else "inline"
+    args = [
+        "fzf",
+        "--header",
+        header,
+        "--header-first",
+        "--reverse",
+        "--no-sort",
+        "--prompt",
+        " Rename > ",
+        "--pointer",
+        ">",
+        "--marker",
+        "*",
+        "--border",
+        border,
+        "--margin",
+        margin,
+        "--padding",
+        "0,1",
+        "--info",
+        info_style,
+        "--color",
+        FZF_COLORS,
+        "--ansi",
+        "--delimiter",
+        "\t",
+        "--with-nth",
+        "1",
+        "--disabled",
+        "--print-query",
+        "--query",
+        initial_query,
+    ]
+    if FZF_VER >= 0.35:
+        args.extend(["--border-label-pos", "3"])
+        if border_label:
+            args.extend(["--border-label", f" {border_label} "])
+    binds = ["ctrl-a:select-all"]
+    if start_index and start_index > 1:
+        downs = "+".join(["down"] * (start_index - 1))
+        binds.append(f"start:{downs}")
+    if start_index and start_index > 1:
+        args.append("--sync")
+    args.extend(["--bind", ",".join(binds)])
+    if preview_cmd:
+        if term_width() < 100:
+            preview_pos = "bottom:50%:wrap:border-top"
+        else:
+            preview_pos = "right:50%:wrap:border-left"
+        args.extend(["--preview", preview_cmd, "--preview-window", preview_pos])
+    try:
+        proc = subprocess.Popen(
+            args,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+        )
+        stdout, _ = proc.communicate(input="\n".join(lines))
+    except FileNotFoundError:
+        print("Error: fzf not found. Install with:")
+        print("  Ubuntu/Debian: sudo apt install fzf")
+        print("  macOS:         brew install fzf")
+        sys.exit(1)
+    if proc.returncode != 0:
+        if proc.returncode == 130:
+            raise KeyboardInterrupt
+        return None, None
+    out_lines = stdout.split("\n")
+    if not out_lines:
+        return "", None
+    query = out_lines[0].strip()
+    selections = [l for l in out_lines[1:] if l.strip()]
+    return query, selections[0] if selections else None
+
+
+# ── Session parsing ───────────────────────────────────────────────────────
+
+
+def _session_id_from_path(path: Path) -> str | None:
+    m = SESSION_ID_RE.search(path.stem)
+    return m.group(1) if m else None
+
+
+def _parse_session_meta(path: Path):
+    try:
+        with path.open("r", errors="replace") as f:
+            for line in f:
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") == "session_meta":
+                    payload = obj.get("payload", {})
+                    ts = payload.get("timestamp")
+                    return {
+                        "id": payload.get("id") or _session_id_from_path(path),
+                        "cwd": payload.get("cwd", ""),
+                        "timestamp": ts,
+                    }
+    except OSError:
+        return None
+    return None
+
+
+def _extract_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") in ("input_text", "output_text", "text"):
+                    parts.append(part.get("text", ""))
+        return "".join(parts)
+    return ""
+
+
+def _format_date(ts: str | None) -> str:
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.strftime("%m/%d/%y").lstrip("0").replace("/0", "/")
+    except Exception:
+        return ts[:16]
+
+
+def _session_size(path: Path) -> str:
+    size = path.stat().st_size
+    if size < 1024:
+        return f"{size}B"
+    if size < 1024 * 1024:
+        return f"{size // 1024}K"
+    return f"{size // (1024 * 1024)}M"
+
+
+def _display_path(path: str) -> str:
+    if not path:
+        return ""
+    home = str(Path.home())
+    if path == home:
+        return "~"
+    if path.startswith(home + os.sep):
+        return "~/" + path[len(home) + 1 :]
+    return path
+
+
+def parse_one_chat(path: Path) -> dict | None:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    size = stat.st_size
+    mtime = stat.st_mtime
+    meta = _parse_session_meta(path)
+    session_id = (meta or {}).get("id") or _session_id_from_path(path) or ""
+    timestamp = (meta or {}).get("timestamp") or ""
+
+    first_user_msg = ""
+    has_assistant = False
+    bytes_read = 0
+
+    try:
+        with path.open("r", errors="replace") as f:
+            for line in f:
+                bytes_read += len(line)
+                if bytes_read > 200000:
+                    break
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "response_item":
+                    continue
+                payload = obj.get("payload", {})
+                if payload.get("type") != "message":
+                    continue
+                role = payload.get("role")
+                content = payload.get("content", [])
+                text = _extract_text(content).strip()
+                if role == "assistant" and text:
+                    has_assistant = True
+                if role == "user" and not first_user_msg:
+                    if text and not _is_system_text(text):
+                        first_user_msg = text.replace("\n", " ").strip()
+                        break
+    except OSError:
+        pass
+
+    if first_user_msg and len(first_user_msg) > 120:
+        first_user_msg = first_user_msg[:117] + "..."
+
+    truly_empty = False
+    if not first_user_msg:
+        first_user_msg = "(resumed session)" if has_assistant else "(empty session)"
+        truly_empty = not has_assistant
+
+    date_str = _format_date(timestamp)
+
+    if size < 1024:
+        size_str = f"{size}B"
+    elif size < 1024 * 1024:
+        size_str = f"{size // 1024}K"
+    else:
+        size_str = f"{size // (1024 * 1024)}M"
+
+    return {
+        "file": str(path),
+        "date": date_str,
+        "size": size_str,
+        "message": first_user_msg,
+        "truly_empty": truly_empty,
+        "timestamp": timestamp or "0",
+        "mtime": mtime,
+        "session_id": session_id,
+    }
+
+
+def list_projects():
+    projects = {}
+    newest = {}
+    for path in SESSION_ROOT.rglob("rollout-*.jsonl"):
+        meta = _parse_session_meta(path)
+        if not meta:
+            continue
+        cwd = meta.get("cwd") or str(Path.home())
+        projects[cwd] = projects.get(cwd, 0) + 1
+        ts = meta.get("timestamp") or ""
+        newest[cwd] = max(newest.get(cwd, ""), ts)
+    items = []
+    for cwd, count in projects.items():
+        missing = not os.path.isdir(cwd)
+        display = _display_path(cwd)
+        items.append((display, cwd, count, newest.get(cwd, ""), missing))
+    return items
+
+
+def sort_projects(items, mode):
+    if mode == "name":
+        return sorted(items, key=lambda p: p[0].lower())
+    if mode == "chats":
+        return sorted(items, key=lambda p: (-p[2], p[0].lower()))
+    if mode == "recent":
+        return sorted(items, key=lambda p: p[3], reverse=True)
+    return items
+
+
+def fmt_project_line(name, count, max_name_len, missing=False):
+    display_name = name
+    if is_compact():
+        max_name = term_width() - 16
+        display_name = name[: max_name - 1] + "~" if len(name) > max_name else name
+        padding = min(max_name, max_name_len) - len(display_name) + 2
+    else:
+        padding = max_name_len - len(name) + 2
+    if missing:
+        return f"  {MAGENTA}{display_name}{' ' * padding}{count:>3d} chats{RESET}"
+    if count == 0:
+        return f"  {DIM}{display_name}{' ' * padding}  0 chats{RESET}"
+    count_color = GREEN if count < 10 else YELLOW if count < 30 else RED
+    return f"  {BOLD}\033[37m{display_name}{RESET}{' ' * padding}{count_color}{count:>3d}{RESET} {DIM}chats{RESET}"
+
+
+def load_chats(project_cwd: str):
+    files = []
+    for path in SESSION_ROOT.rglob("rollout-*.jsonl"):
+        meta = _parse_session_meta(path)
+        if not meta or meta.get("cwd") != project_cwd:
+            continue
+        files.append(path)
+    if not files:
+        return []
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = pool.map(parse_one_chat, files)
+    chats = [r for r in results if r is not None]
+    return chats
+
+
+def sort_chats(chats: list[dict], mode: str) -> list[dict]:
+    return sorted(chats, key=lambda c: c.get("timestamp", "0"), reverse=True)
+
+
+def fmt_chat_line(idx, chat, idx_width, summary=None, title=None):
+    date = chat["date"] or ""
+    size = chat["size"]
+    msg = chat["message"]
+    sid = (chat.get("session_id") or "")[:8]
+    display_text = title or summary or msg
+    if is_compact():
+        max_msg = term_width() - idx_width - 21
+        if not title and msg in ("(empty session)", "(resumed session)"):
+            return f" {DIM}{idx:>{idx_width}} {sid} {size:>4s} {msg}{RESET}"
+        if len(display_text) > max_msg:
+            display_text = display_text[: max_msg - 1] + "~"
+        if title or summary:
+            display_text = f"{CYAN}{display_text}{RESET}"
+        return f" {idx:>{idx_width}} {DIM}{sid}{RESET} {YELLOW}{size:>4s}{RESET} {display_text}"
+    sid_col = f"{sid:<8s}"
+    date_col = f"{date:<8s}"
+    size_col = f"{size:<4s}"
+    if not title and msg in ("(empty session)", "(resumed session)"):
+        return f"  {DIM}{idx:>{idx_width}}  {sid_col}  {date_col}  {size_col}  {msg}{RESET}"
+    display = f"{CYAN}{display_text}{RESET}" if (title or summary) else msg
+    return f"  {idx:>{idx_width}}  {DIM}{sid_col}{RESET}  {DIM}{date_col}{RESET}  {YELLOW}{size_col}{RESET}  {display}"
+
+
+# ── Preview ───────────────────────────────────────────────────────────────
+
+TS_WIDTH = 12
+
+
+def _preview_clean_text(text: str) -> str:
+    text = XML_TAG_RE.sub("", text)
+    text = ANSI_RE.sub("", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _preview_extract_text(content) -> str:
+    return _extract_text(content)
+
+
+def _preview_is_system(content) -> bool:
+    if isinstance(content, str):
+        for tag in SYSTEM_TAGS:
+            if tag in content:
+                return True
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict):
+                text = part.get("text", "") or part.get("content", "")
+                for tag in SYSTEM_TAGS:
+                    if tag in text:
+                        return True
+    return False
+
+
+def _preview_fmt_timestamp(ts: str | None) -> str:
+    if not ts:
+        return " " * TS_WIDTH
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return dt.strftime("%b %d %H:%M")
+    except (ValueError, TypeError):
+        return " " * TS_WIDTH
+
+
+def _preview_render_message(role: str, text: str, ts: str | None) -> str:
+    out = []
+    time_str = _preview_fmt_timestamp(ts)
+    if role == "user":
+        label = f"{GREEN}{BOLD}You   {RESET}"
+    else:
+        label = f"{MAGENTA}{BOLD}Codex {RESET}"
+    out.append(f"  {label}  {DIM}{time_str}{RESET}")
+    for line in text.split("\n"):
+        out.append(f"    {line}")
+    return "\n".join(out)
+
+
+def _preview_read_messages(filepath):
+    messages = []
+    with open(filepath, "r", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if data.get("type") != "response_item":
+                continue
+            payload = data.get("payload", {})
+            if payload.get("type") != "message":
+                continue
+            role = payload.get("role")
+            if role not in ("user", "assistant"):
+                continue
+            raw = payload.get("content", [])
+            if role == "user" and _preview_is_system(raw):
+                continue
+            content = _preview_clean_text(_preview_extract_text(raw))
+            if content:
+                messages.append((role, content, data.get("timestamp", "")))
+    return messages
+
+
+def preview_main(filepath: str):
+    if not os.path.isfile(filepath):
+        print(f"  {DIM}File not found{RESET}")
+        return
+
+    preview_cols = int(os.environ.get("FZF_PREVIEW_COLUMNS", 0))
+    if not preview_cols:
+        try:
+            preview_cols = os.get_terminal_size().columns // 2
+        except OSError:
+            preview_cols = 40
+    cols = max(preview_cols - 3, 20)
+    sep = f"  {DIM}{CYAN}{'~' * cols}{RESET}"
+
+    all_msgs = _preview_read_messages(filepath)
+
+    if not all_msgs:
+        print(f"\n  {DIM}(empty session){RESET}")
+        return
+    print(f"  {GREEN}-- start --{RESET}")
+    for i, (role, text, ts) in enumerate(all_msgs):
+        print(_preview_render_message(role, text, ts))
+        if i < len(all_msgs) - 1:
+            print(sep)
+    print(f"  {RED}-- end --{RESET}")
+
+
+# ── Actions ───────────────────────────────────────────────────────────────
+
+
+def open_folder(path: str) -> None:
+    try:
+        if IS_WINDOWS:
+            subprocess.Popen(["explorer", path])
+        elif _is_wsl():
+            win_path = subprocess.check_output(["wslpath", "-w", path], text=True).strip()
+            subprocess.Popen(["explorer.exe", win_path])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        else:
+            subprocess.Popen(["xdg-open", path])
+    except (FileNotFoundError, OSError):
+        pass
+
+
+def resume_session(session_id: str) -> None:
+    cfg = load_config()
+    cmd = _build_cmd(["codex", "resume", session_id], cfg)
+    os.execvp(cmd[0], cmd)
+
+
+def new_session(cwd: str | None) -> None:
+    cfg = load_config()
+    if cwd:
+        cmd = _build_cmd(["codex", "-C", cwd], cfg)
+        os.execvp(cmd[0], cmd)
+    cmd = _build_cmd(["codex"], cfg)
+    os.execvp(cmd[0], cmd)
+
+
+def delete_chats(chats: list[dict]) -> int:
+    deleted = 0
+    for chat in chats:
+        try:
+            os.unlink(chat["file"])
+            deleted += 1
+        except OSError:
+            pass
+    return deleted
+
+
+def purge_empty(chats: list[dict]) -> int:
+    removed = 0
+    for chat in chats:
+        if chat["truly_empty"]:
+            try:
+                os.unlink(chat["file"])
+                removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def find_sessions_by_fragment(fragment: str) -> list[tuple[str, str]]:
+    matches = []
+    frag = fragment.lower()
+    for path in SESSION_ROOT.rglob("rollout-*.jsonl"):
+        meta = _parse_session_meta(path)
+        if not meta:
+            continue
+        sid = (meta.get("id") or "").lower()
+        if sid == frag or sid.startswith(frag):
+            matches.append((meta.get("id") or "", str(path)))
+    return matches
+
+
+# ── Views ─────────────────────────────────────────────────────────────────
+
+
+def project_view():
+    cfg = load_config()
+    sort_mode = cfg.get("sort_mode", "recent")
+
+    while True:
+        projects = list_projects()
+        if not projects:
+            print("No Codex sessions found.")
+            return
+
+        projects = sort_projects(projects, sort_mode)
+        total = sum(p[2] for p in projects)
+        max_name_len = max((len(p[0]) for p in projects), default=10)
+
+        lines = [fmt_project_line(p[0], p[2], max_name_len, p[4]) + f"\t{p[1]}" for p in projects]
+        project_map = {p[1]: p for p in projects}
+
+        cwd = os.getcwd()
+        cwd_display = _display_path(cwd)
+        sort_label = SORT_LABELS[sort_mode]
+        cwd_line = f"  {CYAN}{cwd_display}{RESET}\n" if FZF_VER < 0.35 else ""
+
+        unsafe = cfg.get("unsafe_mode", False)
+        perms_indicator = f"{GREEN}perms{RESET}" if unsafe else f"{DIM}perms{RESET}"
+        title_line = f"  {DIM}{total} chats, {len(projects)} projects{RESET}"
+        if is_compact():
+            parts = [
+                f"{DIM}Enter{RESET} open",
+                f"{DIM}^n{RESET} new",
+                f"{DIM}^r{RESET} resume",
+                f"{DIM}^f{RESET} folder",
+                f"{DIM}^e{RESET} dir",
+                f"{DIM}^d{RESET} del",
+                f"{DIM}^x{RESET} purge empty",
+                f"{DIM}^p{RESET} {perms_indicator}",
+                f"{DIM}tab{RESET} {CYAN}{sort_label}{RESET}",
+                f"{DIM}esc{RESET} quit",
+            ]
+        else:
+            parts = [
+                f"{DIM}Enter{RESET} open",
+                f"{DIM}^n{RESET} new",
+                f"{DIM}^r{RESET} resume ID",
+                f"{DIM}^f{RESET} folder",
+                f"{DIM}^e{RESET} explorer",
+                f"{DIM}^d{RESET} del",
+                f"{DIM}^x{RESET} purge empty",
+                f"{DIM}^p{RESET} {perms_indicator}",
+                f"{DIM}tab{RESET} {CYAN}{sort_label}{RESET}",
+                f"{DIM}esc{RESET} quit",
+            ]
+        cmd_lines = _wrap_header(parts, term_width() - 2)
+        header = title_line + "\n" + cwd_line + "\n".join(cmd_lines)
+
+        key, sel = fzf(
+            lines,
+            header,
+            prompt=" Projects > ",
+            expect_keys=["tab", "ctrl-n", "ctrl-f", "ctrl-e", "ctrl-r", "ctrl-d", "ctrl-x", "ctrl-p"],
+            border_label=cwd_display,
+        )
+
+        if key == "esc":
+            return
+        if key == "tab":
+            next_idx = (SORT_MODES.index(sort_mode) + 1) % len(SORT_MODES)
+            sort_mode = SORT_MODES[next_idx]
+            cfg["sort_mode"] = sort_mode
+            save_config(cfg)
+            continue
+        if key == "ctrl-p":
+            cfg["unsafe_mode"] = not cfg.get("unsafe_mode")
+            save_config(cfg)
+            continue
+        if key == "ctrl-f":
+            clear_screen()
+            print(f"\n  {BOLD}New project folder{RESET}")
+            print(f"  {DIM}Enter path (~ allowed):{RESET} ", end="", flush=True)
+            folder = input().strip()
+            if not folder:
+                continue
+            folder = os.path.expanduser(folder)
+            folder = os.path.abspath(folder)
+            try:
+                os.makedirs(folder, exist_ok=True)
+            except OSError as e:
+                print(f"\n  {RED}Error: {e}{RESET}")
+                input(f"\n  {DIM}Press Enter...{RESET}")
+                continue
+            return new_session(folder)
+
+        selection = sel[0] if sel else ""
+        project_cwd = ""
+        if selection and "\t" in selection:
+            project_cwd = selection.split("\t", 1)[1]
+        elif selection:
+            stripped = strip_ansi(selection)
+            m = re.match(r"^\s*(.+?)\s+\d+\s+chats\s*$", stripped)
+            if m:
+                name = m.group(1).strip()
+                for cwd, entry in project_map.items():
+                    if entry[0] == name:
+                        project_cwd = cwd
+                        break
+
+        if key == "ctrl-n" and not project_cwd:
+            return new_session(os.getcwd())
+        if key == "ctrl-e" and project_cwd:
+            open_folder(project_cwd)
+            continue
+        if key == "ctrl-r":
+            clear_screen()
+            print(f"\n  {BOLD}Resume by session ID{RESET}")
+            print(f"  {DIM}Enter full or partial ID:{RESET} ", end="", flush=True)
+            fragment = input().strip()
+            if fragment:
+                matches = find_sessions_by_fragment(fragment)
+                if not matches:
+                    print(f"\n  {RED}No session found matching: {fragment}{RESET}")
+                    input(f"\n  {DIM}Press Enter...{RESET}")
+                elif len(matches) > 1:
+                    print(f"\n  {YELLOW}Multiple sessions match:{RESET}")
+                    for sid, _ in matches:
+                        print(f"    {sid}")
+                    input(f"\n  {DIM}Press Enter...{RESET}")
+                else:
+                    resume_session(matches[0][0])
+            continue
+        if key == "ctrl-x":
+            clear_screen()
+            print(f"\n  {DIM}Scanning all projects...{RESET}", flush=True)
+            empty_files = []
+            for path in SESSION_ROOT.rglob("rollout-*.jsonl"):
+                chat = parse_one_chat(path)
+                if chat and chat["truly_empty"]:
+                    empty_files.append(path)
+            if not empty_files:
+                clear_screen()
+                print(f"\n  {DIM}No empty chats found{RESET}")
+                input(f"\n  {DIM}Press Enter...{RESET}")
+            else:
+                clear_screen()
+                print(f"\n  {YELLOW}Found {len(empty_files)} empty chat(s) across all projects.{RESET} Delete all?")
+                answer = input(f"\n  {DIM}(y/N):{RESET} ").strip().lower()
+                if answer == "y":
+                    for fpath in empty_files:
+                        try:
+                            os.unlink(fpath)
+                        except OSError:
+                            pass
+                    clear_screen()
+                    print(f"\n  {GREEN}Purged {len(empty_files)} empty chat(s){RESET}")
+                    input(f"\n  {DIM}Press Enter...{RESET}")
+            continue
+
+        if not project_cwd:
+            continue
+
+        display, real_cwd, count, _, _ = project_map[project_cwd]
+        project_cwd = real_cwd
+
+        if key == "ctrl-n":
+            return new_session(project_cwd)
+        if key == "ctrl-d":
+            if count == 0:
+                continue
+            clear_screen()
+            pname = _display_path(project_cwd)
+            print(f"\n  {YELLOW}{pname}{RESET} has {count} chat(s). Delete all?")
+            answer = input(f"\n  {DIM}(y/N):{RESET} ").strip().lower()
+            if answer == "y":
+                chats = load_chats(project_cwd)
+                delete_chats(chats)
+                clear_screen()
+                print(f"\n  {GREEN}Deleted {count} chat(s).{RESET}")
+                input(f"\n  {DIM}Press Enter...{RESET}")
+            continue
+
+        # Enter: open project
+        if count == 0:
+            return new_session(project_cwd)
+        chat_view(project_cwd)
+
+
+def chat_view(project_cwd: str, start_index: int | None = None):
+    cfg = load_config()
+    sort_mode = "recent"
+
+    while True:
+        chats = sort_chats(load_chats(project_cwd), sort_mode)
+        if not chats:
+            return
+
+        idx_width = len(str(len(chats)))
+        summaries_on = cfg.get("ai_summaries", False)
+        summary_cache = load_summaries() if summaries_on else {}
+        titles = load_titles()
+
+        def build_chat_lines():
+            lines = []
+            for i, chat in enumerate(chats):
+                sid = chat.get("session_id", "")
+                s = summary_cache.get(sid) if summaries_on else None
+                t = titles.get(sid)
+                lines.append(fmt_chat_line(i + 1, chat, idx_width, summary=s, title=t) + f"\t{chat['file']}")
+            return lines
+
+        chat_lines = build_chat_lines()
+        empty_indices = [i for i, c in enumerate(chats) if c["truly_empty"]]
+        empty_hint = f" {DIM}({len(empty_indices)} empty){RESET}" if empty_indices else ""
+
+        unsafe = cfg.get("unsafe_mode", False)
+        perms_indicator = f"{GREEN}perms{RESET}" if unsafe else f"{DIM}perms{RESET}"
+        title_line = f"  {BOLD}{_display_path(project_cwd)}{RESET}  {DIM}{len(chats)} chats{RESET}{empty_hint}"
+        parts = [
+            f"{DIM}Ent{RESET} resume",
+            f"{DIM}^n{RESET} new",
+            f"{DIM}^s{RESET} ai",
+            f"{DIM}^r{RESET} rename",
+            f"{DIM}^d{RESET} del",
+            f"{DIM}^x{RESET} purge",
+            f"{DIM}^p{RESET} {perms_indicator}",
+            f"{DIM}bs{RESET} back",
+        ]
+        wrap_width = max(24, (term_width() // 2) - 4)
+        cmd_lines = _wrap_header(parts, wrap_width)
+        header = title_line + "\n" + "\n".join(cmd_lines)
+
+        preview_cmd = f"{shlex.quote(sys.executable)} {shlex.quote(str(Path(__file__).resolve()))} --preview {{2}}"
+
+        key, sel = fzf(
+            chat_lines,
+            header,
+            multi=True,
+            preview_cmd=preview_cmd,
+            expect_keys=["bs", "ctrl-d", "ctrl-x", "ctrl-n", "ctrl-s", "ctrl-p", "ctrl-r"],
+            border_label="Chats",
+            start_index=start_index,
+        )
+
+        if key == "esc":
+            return
+        if key == "bs":
+            return
+        if key == "ctrl-n":
+            return new_session(project_cwd)
+        if key == "ctrl-s":
+            summaries_on = not summaries_on
+            cfg["ai_summaries"] = summaries_on
+            save_config(cfg)
+            if summaries_on:
+                api_key = load_gemini_key()
+                if not api_key:
+                    api_key = prompt_gemini_key()
+                if not api_key:
+                    summaries_on = False
+                    cfg["ai_summaries"] = False
+                    save_config(cfg)
+                    continue
+                summary_cache = load_summaries()
+                summary_cache = generate_missing_summaries(api_key, chats, summary_cache)
+            continue
+        if key == "ctrl-p":
+            cfg["unsafe_mode"] = not cfg.get("unsafe_mode")
+            save_config(cfg)
+            continue
+        if key == "ctrl-x":
+            indices = empty_indices
+            if not indices:
+                continue
+            confirm_delete(project_cwd, chats, indices)
+            start_index = None
+            continue
+
+        if not sel:
+            continue
+
+        picked = []
+        selected_index = None
+        for s in sel:
+            if "\t" in s:
+                picked.append(s.split("\t", 1)[1])
+                if selected_index is None:
+                    m = re.match(r"^\s*(\d+)", strip_ansi(s))
+                    if m:
+                        selected_index = int(m.group(1))
+            else:
+                stripped = strip_ansi(s)
+                line_map = {strip_ansi(line.split("\t", 1)[0]): line.split("\t", 1)[1] for line in chat_lines if "\t" in line}
+                if stripped in line_map:
+                    picked.append(line_map[stripped])
+                    if selected_index is None:
+                        m = re.match(r"^\s*(\d+)", stripped)
+                        if m:
+                            selected_index = int(m.group(1))
+
+        picked_chats = [c for c in chats if c["file"] in picked]
+
+        if key == "ctrl-r":
+            if not picked_chats:
+                continue
+            chat = picked_chats[0]
+            sid = chat.get("session_id", "")
+            current_title = titles.get(sid, "")
+            current_label = current_title or chat["message"]
+            rename_header = (
+                f"  {BOLD}Rename chat{RESET}  {DIM}(enter to save, esc to cancel){RESET}\n"
+                f"  {DIM}Current:{RESET} {current_label}"
+            )
+            query, picked_line = fzf_rename(
+                chat_lines,
+                rename_header,
+                preview_cmd=preview_cmd,
+                border_label="Chats",
+                start_index=selected_index or 1,
+                initial_query="",
+            )
+            if query is None:
+                continue
+            new_title = query.strip()
+            if picked_line and "\t" in picked_line:
+                picked_path = picked_line.split("\t", 1)[1]
+                for c in chats:
+                    if c["file"] == picked_path:
+                        sid = c.get("session_id", sid)
+                        break
+            if new_title:
+                if len(new_title) > 120:
+                    new_title = new_title[:117] + "..."
+                titles[sid] = new_title
+            else:
+                titles.pop(sid, None)
+            save_titles(titles)
+            continue
+
+        if key == "ctrl-d":
+            indices = []
+            for line in sel:
+                clean = strip_ansi(line).strip()
+                if clean:
+                    m = re.match(r"^(\d+)", clean)
+                    if m:
+                        indices.append(int(m.group(1)) - 1)
+        else:
+            indices = []
+
+        if key == "ctrl-d":
+            if not indices:
+                continue
+            confirm_delete(project_cwd, chats, indices)
+            start_index = selected_index
+            continue
+
+        # Enter => resume
+        if picked_chats:
+            resume_session(picked_chats[0]["session_id"])
+
+
+def confirm_delete(project_cwd: str, chats: list[dict], indices: list[int]) -> None:
+    clear_screen()
+    try:
+        cols = os.get_terminal_size().columns
+    except OSError:
+        cols = 80
+
+    n = len(indices)
+    label = f"conversation{'s' if n != 1 else ''}"
+    total_size = 0
+    for idx in indices:
+        try:
+            total_size += os.path.getsize(chats[idx]["file"])
+        except OSError:
+            pass
+    if total_size < 1024:
+        size_str = f"{total_size}B"
+    elif total_size < 1024 * 1024:
+        size_str = f"{total_size // 1024}KB"
+    else:
+        size_str = f"{total_size // (1024 * 1024)}MB"
+
+    print()
+    print(f"  {RED}{'~' * (cols - 4)}{RESET}")
+    print()
+    print(f"  {RED}{BOLD}  Delete {n} {label}{RESET}  {DIM}({size_str}){RESET}")
+    print(f"  {DIM}  from {BOLD}{_display_path(project_cwd)}{RESET}")
+    print()
+    print(f"  {RED}{'~' * (cols - 4)}{RESET}")
+    print()
+
+    for idx in indices:
+        chat = chats[idx]
+        date = chat["date"] or "                "
+        size = chat["size"]
+        msg = chat["message"][:65]
+        print(f"    {RED}x{RESET}  {DIM}{date:<16s}{RESET}  {YELLOW}{size:>4s}{RESET}  {msg}")
+
+    print()
+    print(f"  {RED}{'~' * (cols - 4)}{RESET}")
+    print()
+    answer = input(f"  {BOLD}Confirm delete? {RED}y{RESET}{DIM}/{RESET}{GREEN}N{RESET} ").strip().lower()
+
+    if answer == "y":
+        deleted = 0
+        for idx in indices:
+            chat = chats[idx]
+            try:
+                os.remove(chat["file"])
+                deleted += 1
+            except OSError as e:
+                print(f"  {RED}Error: {e}{RESET}")
+        print()
+        print(f"  {GREEN}{BOLD}  Deleted {deleted} {label}.{RESET}")
+        print()
+        input(f"  {DIM}Press Enter...{RESET}")
+    else:
+        print(f"\n  {DIM}Cancelled.{RESET}")
+        input(f"\n  {DIM}Press Enter...{RESET}")
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────
+
+
+def print_help():
+    print("codex-chats - Browse and manage Codex CLI conversations")
+    print()
+    print("Usage: codex-chats [OPTIONS]")
+    print()
+    print("Options:")
+    print("  --help       Show this help message")
+    print("  --set-key    Set/update Gemini API key for AI summaries")
+    print("  --resume ID  Resume a session by full or partial ID")
+    print()
+    print("Project view:")
+    print("  Enter    Browse conversations in selected project")
+    print("  ctrl-n   Start new session in selected project")
+    print("  ctrl-f   Create new project folder")
+    print("  tab      Cycle sort order (A-Z / Most chats / Recent)")
+    print("  esc      Quit")
+    print()
+    print("  ctrl-d   Delete selected project (with confirmation)")
+    print("  ctrl-x   Purge all empty chats across all projects")
+    print("  ctrl-e   Open project folder in file explorer")
+    print("  ctrl-r   Resume by session ID")
+    print("  ctrl-p   Toggle perms mode")
+    print()
+    print("Chat view:")
+    print("  Ent      Resume highlighted conversation in Codex")
+    print("  ctrl-n   Start new session in current project")
+    print("  space    Toggle selection")
+    print("  ctrl-a   Select all")
+    print("  ctrl-s   Toggle AI summaries (Gemini)")
+    print("  ctrl-r   Rename selected chat")
+    print("  ctrl-d   Delete selected conversations")
+    print("  ctrl-x   Purge empty sessions (no real content)")
+    print("  ctrl-p   Toggle perms mode")
+    print("  backspace  Back to project list")
+    print("  esc      Quit")
+    print()
+    print("Requirements: Python 3.7+, fzf")
+
+
+def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--preview" and len(sys.argv) > 2:
+        preview_main(sys.argv[2])
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--set-key":
+        key = prompt_gemini_key()
+        if key:
+            print(f"  {GREEN}Gemini API key configured.{RESET}")
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] in ("--help", "-h"):
+        print_help()
+        return
+
+    if len(sys.argv) > 2 and sys.argv[1] in ("--resume", "-r"):
+        fragment = sys.argv[2]
+        matches = find_sessions_by_fragment(fragment)
+        if not matches:
+            print(f"No session found matching: {fragment}")
+            sys.exit(1)
+        if len(matches) > 1:
+            print(f"Multiple sessions match '{fragment}':")
+            for sid, _ in matches:
+                print(f"  {sid}")
+            sys.exit(1)
+        resume_session(matches[0][0])
+        return
+
+    if not SESSION_ROOT.exists():
+        print("No Codex sessions found.")
+        return
+
+    project_view()
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(0)
