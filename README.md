@@ -20,7 +20,7 @@ Interactive, fzf-driven browser for the Codex CLI session archive (`~/.codex/ses
 ## Install (WSL / Linux)
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/korboybeats/codex-chats
 cd codex-chats
 ./install.sh
 ```
@@ -35,7 +35,7 @@ Requirements:
 - `codex` in PATH
 
 ```powershell
-git clone <this-repo>
+git clone https://github.com/korboybeats/codex-chats
 cd codex-chats
 .\install.ps1
 ```
