@@ -1035,7 +1035,7 @@ def project_view():
         project_cwd = real_cwd
 
         if key == "ctrl-n":
-            return new_session(project_cwd)
+            return new_session(os.getcwd())
         if key == "ctrl-d":
             if count == 0:
                 continue

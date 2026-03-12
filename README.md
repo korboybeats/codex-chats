@@ -58,7 +58,7 @@ codex-chats
 
 Project view:
 - `Enter` open project
-- `Ctrl-N` new session (in selected project)
+- `Ctrl-N` new session (current directory)
 - `Ctrl-F` create project folder
 - `Ctrl-R` resume by session ID
 - `Ctrl-E` open folder in file explorer
