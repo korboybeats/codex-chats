@@ -34,18 +34,18 @@ Requirements:
 - `fzf` in PATH (Scoop: `scoop install fzf`, or Chocolatey: `choco install fzf`)
 - `codex` in PATH
 
-```powershell
+```cmd
 git clone https://github.com/korboybeats/codex-chats
 cd codex-chats
-.\install.ps1
+install.cmd
 ```
 
 This installs to `%USERPROFILE%\\bin` and adds it to your user PATH.
 
-You can also run it from CMD:
+PowerShell alternative:
 
-```cmd
-install.cmd
+```powershell
+.\install.ps1
 ```
 
 ## Usage
