@@ -326,6 +326,8 @@ def fzf(lines, header, multi=False, prompt=" ", preview_cmd=None, expect_keys=No
         args.append("--multi")
         binds.append("space:toggle+down")
     if expect_keys:
+        if "tab" in expect_keys:
+            binds.append("tab:accept")
         args.extend(["--expect", ",".join(expect_keys)])
     if start_index and start_index > 1:
         args.append("--sync")
@@ -839,6 +841,19 @@ def purge_empty(chats: list[dict]) -> int:
     return removed
 
 
+def delete_chats_by_message(chats: list[dict], message: str) -> int:
+    deleted = 0
+    for chat in chats:
+        if chat.get("message") != message:
+            continue
+        try:
+            os.unlink(chat["file"])
+            deleted += 1
+        except OSError:
+            pass
+    return deleted
+
+
 def find_sessions_by_fragment(fragment: str) -> list[tuple[str, str]]:
     matches = []
     frag = fragment.lower()
@@ -1074,6 +1089,7 @@ def chat_view(project_cwd: str, start_index: int | None = None):
             f"{DIM}^n{RESET} new",
             f"{DIM}^s{RESET} ai",
             f"{DIM}^r{RESET} rename",
+            f"{DIM}^y{RESET} purge msg",
             f"{DIM}^d{RESET} del",
             f"{DIM}^x{RESET} purge",
             f"{DIM}^p{RESET} {perms_indicator}",
@@ -1090,7 +1106,7 @@ def chat_view(project_cwd: str, start_index: int | None = None):
             header,
             multi=True,
             preview_cmd=preview_cmd,
-            expect_keys=["bs", "ctrl-d", "ctrl-x", "ctrl-n", "ctrl-s", "ctrl-p", "ctrl-r"],
+            expect_keys=["bs", "ctrl-d", "ctrl-x", "ctrl-n", "ctrl-s", "ctrl-p", "ctrl-r", "ctrl-y"],
             border_label="Chats",
             start_index=start_index,
         )
@@ -1188,6 +1204,34 @@ def chat_view(project_cwd: str, start_index: int | None = None):
             else:
                 titles.pop(sid, None)
             save_titles(titles)
+            continue
+        if key == "ctrl-y":
+            default_msg = picked_chats[0]["message"] if picked_chats else ""
+            clear_screen()
+            print(f"\n  {BOLD}Purge by message{RESET}")
+            if default_msg:
+                print(f"  {DIM}Selected:{RESET} {default_msg}")
+            print(f"  {DIM}Enter exact first message to match.{RESET}")
+            prompt = "\n  " + (f"{BOLD}Message (blank = selected):{RESET} " if default_msg else f"{BOLD}Message:{RESET} ")
+            msg = input(prompt).strip()
+            if not msg:
+                msg = default_msg
+            if not msg:
+                continue
+            matches = [c for c in chats if c.get("message") == msg]
+            if not matches:
+                clear_screen()
+                print(f"\n  {DIM}No chats match that message.{RESET}")
+                input(f"\n  {DIM}Press Enter...{RESET}")
+                continue
+            clear_screen()
+            print(f"\n  {YELLOW}Found {len(matches)} chat(s) with:{RESET} {msg}")
+            answer = input(f"\n  {DIM}Delete all? (y/N):{RESET} ").strip().lower()
+            if answer == "y":
+                deleted = delete_chats_by_message(matches, msg)
+                clear_screen()
+                print(f"\n  {GREEN}Deleted {deleted} chat(s).{RESET}")
+                input(f"\n  {DIM}Press Enter...{RESET}")
             continue
 
         if key == "ctrl-d":

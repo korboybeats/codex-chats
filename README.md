@@ -72,6 +72,7 @@ Chats view:
 - `Ctrl-N` new session
 - `Ctrl-S` toggle AI summaries (Gemini)
 - `Ctrl-R` rename chat (local title overlay)
+- `Ctrl-Y` purge chats by first message (exact match)
 - `Ctrl-D` delete selected chats
 - `Ctrl-X` purge empty chats
 - `Ctrl-P` toggle perms mode
