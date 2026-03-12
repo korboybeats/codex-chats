@@ -597,13 +597,16 @@ def list_projects():
             continue
         cwd = meta.get("cwd") or str(Path.home())
         projects[cwd] = projects.get(cwd, 0) + 1
-        ts = meta.get("timestamp") or ""
-        newest[cwd] = max(newest.get(cwd, ""), ts)
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            mtime = 0
+        newest[cwd] = max(newest.get(cwd, 0), mtime)
     items = []
     for cwd, count in projects.items():
         missing = not os.path.isdir(cwd)
         display = _display_path(cwd)
-        items.append((display, cwd, count, newest.get(cwd, ""), missing))
+        items.append((display, cwd, count, newest.get(cwd, 0), missing))
     return items
 
 
@@ -649,7 +652,7 @@ def load_chats(project_cwd: str):
 
 
 def sort_chats(chats: list[dict], mode: str) -> list[dict]:
-    return sorted(chats, key=lambda c: c.get("timestamp", "0"), reverse=True)
+    return sorted(chats, key=lambda c: c.get("mtime", 0), reverse=True)
 
 
 def fmt_chat_line(idx, chat, idx_width, summary=None, title=None):
