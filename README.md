@@ -42,6 +42,12 @@ cd codex-chats
 
 This installs to `%USERPROFILE%\\bin` and adds it to your user PATH.
 
+You can also run it from CMD:
+
+```cmd
+install.cmd
+```
+
 ## Usage
 
 ```bash
