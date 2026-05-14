@@ -31,6 +31,7 @@ SUMMARY_CACHE = Path.home() / ".codex" / "codex-chats-summaries.json"
 GEMINI_KEY_FILE = Path.home() / ".gemini_api_key"
 TITLES_FILE = Path.home() / ".codex" / "codex-chats-titles.json"
 _STATE_UPDATED_CACHE: tuple[dict[str, float], dict[str, float]] | None = None
+_THREAD_SOURCE_CACHE: dict[str, str] | None = None
 _HISTORY_CACHE: dict[str, tuple[float, str]] | None = None
 
 IS_WINDOWS = sys.platform == "win32"
@@ -493,6 +494,35 @@ def _load_state_updated() -> tuple[dict[str, float], dict[str, float]]:
     return _STATE_UPDATED_CACHE
 
 
+def _load_thread_sources() -> dict[str, str]:
+    global _THREAD_SOURCE_CACHE
+    if _THREAD_SOURCE_CACHE is not None:
+        return _THREAD_SOURCE_CACHE
+
+    sources: dict[str, str] = {}
+    if STATE_DB.exists():
+        try:
+            con = sqlite3.connect(STATE_DB)
+            try:
+                rows = con.execute("select id, thread_source from threads")
+                for sid, thread_source in rows:
+                    if sid:
+                        sources[str(sid)] = str(thread_source or "")
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
+
+    _THREAD_SOURCE_CACHE = sources
+    return _THREAD_SOURCE_CACHE
+
+
+def _is_subagent_thread(session_id: str | None) -> bool:
+    if not session_id:
+        return False
+    return _load_thread_sources().get(session_id) == "subagent"
+
+
 def _load_history_latest() -> dict[str, tuple[float, str]]:
     global _HISTORY_CACHE
     if _HISTORY_CACHE is not None:
@@ -738,6 +768,8 @@ def list_projects():
         meta = _parse_session_meta(path)
         if not meta:
             continue
+        if _is_subagent_thread(meta.get("id") or _session_id_from_path(path)):
+            continue
         cwd = meta.get("cwd") or str(Path.home())
         projects[cwd] = projects.get(cwd, 0) + 1
         try:
@@ -761,8 +793,12 @@ def usage_check():
     total_bytes = 0
 
     for path in SESSION_ROOT.rglob("rollout-*.jsonl"):
+        if _is_system_only_session(path):
+            continue
         meta = _parse_session_meta(path)
         if not meta:
+            continue
+        if _is_subagent_thread(meta.get("id") or _session_id_from_path(path)):
             continue
         cwd = meta.get("cwd") or str(Path.home())
         try:
@@ -838,6 +874,8 @@ def load_chats(project_cwd: str):
     for path in SESSION_ROOT.rglob("rollout-*.jsonl"):
         meta = _parse_session_meta(path)
         if not meta or meta.get("cwd") != project_cwd:
+            continue
+        if _is_subagent_thread(meta.get("id") or _session_id_from_path(path)):
             continue
         files.append(path)
     if not files:
