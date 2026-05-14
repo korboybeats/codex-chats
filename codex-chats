@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import shlex
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -23,10 +24,12 @@ if sys.version_info < (3, 7):
     sys.exit(1)
 
 SESSION_ROOT = Path.home() / ".codex" / "sessions"
+STATE_DB = Path.home() / ".codex" / "state_5.sqlite"
 CONFIG_FILE = Path.home() / ".codex" / "codex-chats.json"
 SUMMARY_CACHE = Path.home() / ".codex" / "codex-chats-summaries.json"
 GEMINI_KEY_FILE = Path.home() / ".gemini_api_key"
 TITLES_FILE = Path.home() / ".codex" / "codex-chats-titles.json"
+_STATE_UPDATED_CACHE: tuple[dict[str, float], dict[str, float]] | None = None
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -455,6 +458,44 @@ def _session_id_from_path(path: Path) -> str | None:
     return m.group(1) if m else None
 
 
+def _load_state_updated() -> tuple[dict[str, float], dict[str, float]]:
+    global _STATE_UPDATED_CACHE
+    if _STATE_UPDATED_CACHE is not None:
+        return _STATE_UPDATED_CACHE
+
+    by_path: dict[str, float] = {}
+    by_id: dict[str, float] = {}
+    if STATE_DB.exists():
+        try:
+            con = sqlite3.connect(STATE_DB)
+            try:
+                rows = con.execute(
+                    "select id, rollout_path, updated_at_ms from threads "
+                    "where updated_at_ms is not null"
+                )
+                for sid, rollout_path, updated_at_ms in rows:
+                    try:
+                        last_seen = float(updated_at_ms) / 1000
+                    except (TypeError, ValueError):
+                        continue
+                    if sid:
+                        by_id[str(sid)] = last_seen
+                    if rollout_path:
+                        by_path[str(rollout_path)] = last_seen
+            finally:
+                con.close()
+        except sqlite3.Error:
+            pass
+
+    _STATE_UPDATED_CACHE = (by_path, by_id)
+    return _STATE_UPDATED_CACHE
+
+
+def _session_last_seen(path: Path, fallback: float, session_id: str | None = None) -> float:
+    by_path, by_id = _load_state_updated()
+    return max(fallback, by_path.get(str(path), 0), by_id.get(session_id or "", 0))
+
+
 def _parse_session_meta(path: Path):
     try:
         with path.open("r", errors="replace") as f:
@@ -545,9 +586,9 @@ def parse_one_chat(path: Path) -> dict | None:
     except OSError:
         return None
     size = stat.st_size
-    mtime = stat.st_mtime
     meta = _parse_session_meta(path)
     session_id = (meta or {}).get("id") or _session_id_from_path(path) or ""
+    mtime = _session_last_seen(path, stat.st_mtime, session_id)
     cwd = (meta or {}).get("cwd") or ""
     timestamp = (meta or {}).get("timestamp") or ""
 
@@ -663,10 +704,12 @@ def list_projects():
         cwd = meta.get("cwd") or str(Path.home())
         projects[cwd] = projects.get(cwd, 0) + 1
         try:
-            mtime = path.stat().st_mtime
+            stat = path.stat()
         except OSError:
-            mtime = 0
-        newest[cwd] = max(newest.get(cwd, 0), mtime)
+            last_seen = 0
+        else:
+            last_seen = _session_last_seen(path, stat.st_mtime, meta.get("id") or _session_id_from_path(path))
+        newest[cwd] = max(newest.get(cwd, 0), last_seen)
     items = []
     for cwd, count in projects.items():
         missing = not os.path.isdir(cwd)
@@ -689,10 +732,11 @@ def usage_check():
             stat = path.stat()
         except OSError:
             continue
+        last_seen = _session_last_seen(path, stat.st_mtime, meta.get("id") or _session_id_from_path(path))
         entry = projects.setdefault(cwd, {"count": 0, "size": 0, "newest": 0.0})
         entry["count"] += 1
         entry["size"] += stat.st_size
-        entry["newest"] = max(entry["newest"], stat.st_mtime)
+        entry["newest"] = max(entry["newest"], last_seen)
         total_chats += 1
         total_bytes += stat.st_size
 
