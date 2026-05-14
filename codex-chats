@@ -25,11 +25,13 @@ if sys.version_info < (3, 7):
 
 SESSION_ROOT = Path.home() / ".codex" / "sessions"
 STATE_DB = Path.home() / ".codex" / "state_5.sqlite"
+HISTORY_FILE = Path.home() / ".codex" / "history.jsonl"
 CONFIG_FILE = Path.home() / ".codex" / "codex-chats.json"
 SUMMARY_CACHE = Path.home() / ".codex" / "codex-chats-summaries.json"
 GEMINI_KEY_FILE = Path.home() / ".gemini_api_key"
 TITLES_FILE = Path.home() / ".codex" / "codex-chats-titles.json"
 _STATE_UPDATED_CACHE: tuple[dict[str, float], dict[str, float]] | None = None
+_HISTORY_CACHE: dict[str, tuple[float, str]] | None = None
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -491,9 +493,44 @@ def _load_state_updated() -> tuple[dict[str, float], dict[str, float]]:
     return _STATE_UPDATED_CACHE
 
 
+def _load_history_latest() -> dict[str, tuple[float, str]]:
+    global _HISTORY_CACHE
+    if _HISTORY_CACHE is not None:
+        return _HISTORY_CACHE
+
+    latest: dict[str, tuple[float, str]] = {}
+    if HISTORY_FILE.exists():
+        try:
+            with HISTORY_FILE.open("r", errors="replace") as f:
+                for line in f:
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    sid = obj.get("session_id")
+                    ts = obj.get("ts")
+                    text = obj.get("text")
+                    if not sid or not isinstance(text, str):
+                        continue
+                    try:
+                        last_seen = float(ts)
+                    except (TypeError, ValueError):
+                        continue
+                    current = latest.get(str(sid))
+                    if current is None or last_seen > current[0]:
+                        latest[str(sid)] = (last_seen, text)
+        except OSError:
+            pass
+
+    _HISTORY_CACHE = latest
+    return _HISTORY_CACHE
+
+
 def _session_last_seen(path: Path, fallback: float, session_id: str | None = None) -> float:
     by_path, by_id = _load_state_updated()
-    return max(fallback, by_path.get(str(path), 0), by_id.get(session_id or "", 0))
+    history = _load_history_latest()
+    history_seen = history.get(session_id or "", (0, ""))[0]
+    return max(fallback, by_path.get(str(path), 0), by_id.get(session_id or "", 0), history_seen)
 
 
 def _parse_session_meta(path: Path):
