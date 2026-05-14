@@ -7,6 +7,7 @@ Interactive, fzf-driven browser for the Codex CLI session archive (`~/.codex/ses
 - `fzf` picker with header hints, live preview, and shortcut bindings.
 - Preview shows the full conversation (scrollable in the preview pane).
 - Resume by session ID, rename chats (local overlay), and purge empty sessions.
+- Resumes chats from their saved session directory to avoid Codex's cwd prompt.
 - Optional AI summaries (Gemini) with cached results.
 
 ## Getting started
@@ -83,3 +84,4 @@ Chats view:
 
 - Renames are stored locally in `~/.codex/codex-chats-titles.json`.
 - AI summaries use your Gemini API key stored at `~/.gemini_api_key`.
+- Resume actions pass the session cwd to `codex resume -C <cwd> <session-id>`.
