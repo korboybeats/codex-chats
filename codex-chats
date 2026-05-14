@@ -72,6 +72,8 @@ SYSTEM_TAGS = [
     "<local-command-",
     "<command-name>",
     "<system-reminder>",
+    "The following is the Codex agent history",
+    "Codex agent history whose request action",
 ]
 
 
@@ -90,7 +92,7 @@ def clear_screen() -> None:
     if IS_WINDOWS:
         os.system("cls")
     else:
-        sys.stdout.write("\033[2J\033[H")
+        sys.stdout.write("\033[H\033[2J\033[3J")
         sys.stdout.flush()
 
 
@@ -506,6 +508,26 @@ def _session_size(path: Path) -> str:
     return f"{size // (1024 * 1024)}M"
 
 
+def _format_bytes(size: int) -> str:
+    if size < 1024:
+        return f"{size}B"
+    if size < 1024 * 1024:
+        return f"{size // 1024}K"
+    if size < 1024 * 1024 * 1024:
+        return f"{size // (1024 * 1024)}M"
+    return f"{size // (1024 * 1024 * 1024)}G"
+
+
+def _format_last_seen(ts: float) -> str:
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromtimestamp(ts)
+        return dt.strftime("%m/%d/%y %H:%M").lstrip("0").replace("/0", "/")
+    except Exception:
+        return ""
+
+
 def _display_path(path: str) -> str:
     if not path:
         return ""
@@ -526,10 +548,12 @@ def parse_one_chat(path: Path) -> dict | None:
     mtime = stat.st_mtime
     meta = _parse_session_meta(path)
     session_id = (meta or {}).get("id") or _session_id_from_path(path) or ""
+    cwd = (meta or {}).get("cwd") or ""
     timestamp = (meta or {}).get("timestamp") or ""
 
     first_user_msg = ""
     has_assistant = False
+    saw_user = False
     bytes_read = 0
 
     try:
@@ -553,11 +577,16 @@ def parse_one_chat(path: Path) -> dict | None:
                 if role == "assistant" and text:
                     has_assistant = True
                 if role == "user" and not first_user_msg:
-                    if text and not _is_system_text(text):
+                    if text:
+                        saw_user = True
+                        if _is_system_text(text):
+                            continue
                         first_user_msg = text.replace("\n", " ").strip()
                         break
     except OSError:
         pass
+
+    system_only = bool(saw_user and not first_user_msg)
 
     if first_user_msg and len(first_user_msg) > 120:
         first_user_msg = first_user_msg[:117] + "..."
@@ -585,13 +614,49 @@ def parse_one_chat(path: Path) -> dict | None:
         "timestamp": timestamp or "0",
         "mtime": mtime,
         "session_id": session_id,
+        "cwd": cwd,
+        "system_only": system_only,
     }
+
+
+def _is_system_only_session(path: Path) -> bool:
+    saw_user = False
+    bytes_read = 0
+    try:
+        with path.open("r", errors="replace") as f:
+            for line in f:
+                bytes_read += len(line)
+                if bytes_read > 200000:
+                    break
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if obj.get("type") != "response_item":
+                    continue
+                payload = obj.get("payload", {})
+                if payload.get("type") != "message":
+                    continue
+                if payload.get("role") != "user":
+                    continue
+                text = _extract_text(payload.get("content", [])).strip()
+                if not text:
+                    continue
+                saw_user = True
+                if _is_system_text(text):
+                    continue
+                return False
+    except OSError:
+        return False
+    return saw_user
 
 
 def list_projects():
     projects = {}
     newest = {}
     for path in SESSION_ROOT.rglob("rollout-*.jsonl"):
+        if _is_system_only_session(path):
+            continue
         meta = _parse_session_meta(path)
         if not meta:
             continue
@@ -608,6 +673,57 @@ def list_projects():
         display = _display_path(cwd)
         items.append((display, cwd, count, newest.get(cwd, 0), missing))
     return items
+
+
+def usage_check():
+    projects: dict[str, dict[str, int | float]] = {}
+    total_chats = 0
+    total_bytes = 0
+
+    for path in SESSION_ROOT.rglob("rollout-*.jsonl"):
+        meta = _parse_session_meta(path)
+        if not meta:
+            continue
+        cwd = meta.get("cwd") or str(Path.home())
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        entry = projects.setdefault(cwd, {"count": 0, "size": 0, "newest": 0.0})
+        entry["count"] += 1
+        entry["size"] += stat.st_size
+        entry["newest"] = max(entry["newest"], stat.st_mtime)
+        total_chats += 1
+        total_bytes += stat.st_size
+
+    if not projects:
+        print("No Codex sessions found.")
+        return
+
+    rows = []
+    for cwd, info in projects.items():
+        rows.append((cwd, info["count"], info["size"], info["newest"]))
+    rows.sort(key=lambda r: r[3], reverse=True)
+
+    display_rows = []
+    max_proj = max((len(_display_path(r[0])) for r in rows), default=0)
+    max_proj = max(max_proj, len("Project"))
+
+    print("Codex session usage")
+    print("-" * (max_proj + 32))
+    header = f"{'Project':{max_proj}}  {'Chats':>6}  {'Size':>7}  {'Last session'}"
+    print(header)
+    print("-" * (max_proj + 32))
+
+    for cwd, count, size, newest in rows:
+        display = _display_path(cwd)
+        size_str = _format_bytes(int(size))
+        last = _format_last_seen(float(newest))
+        print(f"{display:{max_proj}}  {count:>6}  {size_str:>7}  {last}")
+
+    print("-" * (max_proj + 32))
+    total_line = f"Totals: {total_chats} chats, {_format_bytes(total_bytes)}"
+    print(total_line)
 
 
 def sort_projects(items, mode):
@@ -647,7 +763,7 @@ def load_chats(project_cwd: str):
         return []
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = pool.map(parse_one_chat, files)
-    chats = [r for r in results if r is not None]
+    chats = [r for r in results if r is not None and not r.get("system_only")]
     return chats
 
 
@@ -656,27 +772,27 @@ def sort_chats(chats: list[dict], mode: str) -> list[dict]:
 
 
 def fmt_chat_line(idx, chat, idx_width, summary=None, title=None):
-    date = chat["date"] or ""
     size = chat["size"]
     msg = chat["message"]
     sid = (chat.get("session_id") or "")[:8]
+    last = _format_last_seen(chat.get("mtime", 0))
     display_text = title or summary or msg
     if is_compact():
-        max_msg = term_width() - idx_width - 21
+        max_msg = term_width() - idx_width - 31
         if not title and msg in ("(empty session)", "(resumed session)"):
-            return f" {DIM}{idx:>{idx_width}} {sid} {size:>4s} {msg}{RESET}"
+            return f" {DIM}{idx:>{idx_width}} {sid} {last:<14s} {size:>4s} {msg}{RESET}"
         if len(display_text) > max_msg:
             display_text = display_text[: max_msg - 1] + "~"
         if title or summary:
             display_text = f"{CYAN}{display_text}{RESET}"
-        return f" {idx:>{idx_width}} {DIM}{sid}{RESET} {YELLOW}{size:>4s}{RESET} {display_text}"
+        return f" {idx:>{idx_width}} {DIM}{sid}{RESET} {DIM}{last:<14s}{RESET} {YELLOW}{size:>4s}{RESET} {display_text}"
     sid_col = f"{sid:<8s}"
-    date_col = f"{date:<8s}"
+    last_col = f"{last:<14s}"
     size_col = f"{size:<4s}"
     if not title and msg in ("(empty session)", "(resumed session)"):
-        return f"  {DIM}{idx:>{idx_width}}  {sid_col}  {date_col}  {size_col}  {msg}{RESET}"
+        return f"  {DIM}{idx:>{idx_width}}  {sid_col}  {last_col}  {size_col}  {msg}{RESET}"
     display = f"{CYAN}{display_text}{RESET}" if (title or summary) else msg
-    return f"  {idx:>{idx_width}}  {DIM}{sid_col}{RESET}  {DIM}{date_col}{RESET}  {YELLOW}{size_col}{RESET}  {display}"
+    return f"  {idx:>{idx_width}}  {DIM}{sid_col}{RESET}  {DIM}{last_col}{RESET}  {YELLOW}{size_col}{RESET}  {display}"
 
 
 # ── Preview ───────────────────────────────────────────────────────────────
@@ -806,9 +922,13 @@ def open_folder(path: str) -> None:
         pass
 
 
-def resume_session(session_id: str) -> None:
+def resume_session(session_id: str, cwd: str | None = None) -> None:
     cfg = load_config()
-    cmd = _build_cmd(["codex", "resume", session_id], cfg)
+    args = ["codex", "resume"]
+    if cwd:
+        args.extend(["-C", cwd])
+    args.append(session_id)
+    cmd = _build_cmd(args, cfg)
     os.execvp(cmd[0], cmd)
 
 
@@ -866,7 +986,7 @@ def find_sessions_by_fragment(fragment: str) -> list[tuple[str, str]]:
             continue
         sid = (meta.get("id") or "").lower()
         if sid == frag or sid.startswith(frag):
-            matches.append((meta.get("id") or "", str(path)))
+            matches.append((meta.get("id") or "", meta.get("cwd") or ""))
     return matches
 
 
@@ -999,7 +1119,7 @@ def project_view():
                         print(f"    {sid}")
                     input(f"\n  {DIM}Press Enter...{RESET}")
                 else:
-                    resume_session(matches[0][0])
+                    resume_session(matches[0][0], matches[0][1])
             continue
         if key == "ctrl-x":
             clear_screen()
@@ -1257,7 +1377,7 @@ def chat_view(project_cwd: str, start_index: int | None = None):
 
         # Enter => resume
         if picked_chats:
-            resume_session(picked_chats[0]["session_id"])
+            resume_session(picked_chats[0]["session_id"], picked_chats[0].get("cwd") or project_cwd)
 
 
 def confirm_delete(project_cwd: str, chats: list[dict], indices: list[int]) -> None:
@@ -1374,6 +1494,10 @@ def main():
         preview_main(sys.argv[2])
         return
 
+    if len(sys.argv) > 1 and sys.argv[1] == "check":
+        usage_check()
+        return
+
     if len(sys.argv) > 1 and sys.argv[1] == "--set-key":
         key = prompt_gemini_key()
         if key:
@@ -1395,7 +1519,7 @@ def main():
             for sid, _ in matches:
                 print(f"  {sid}")
             sys.exit(1)
-        resume_session(matches[0][0])
+        resume_session(matches[0][0], matches[0][1])
         return
 
     if not SESSION_ROOT.exists():
@@ -1409,4 +1533,5 @@ if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
+        clear_screen()
         sys.exit(0)
