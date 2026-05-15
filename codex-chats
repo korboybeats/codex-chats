@@ -30,9 +30,14 @@ CONFIG_FILE = Path.home() / ".codex" / "codex-chats.json"
 SUMMARY_CACHE = Path.home() / ".codex" / "codex-chats-summaries.json"
 GEMINI_KEY_FILE = Path.home() / ".gemini_api_key"
 TITLES_FILE = Path.home() / ".codex" / "codex-chats-titles.json"
+METADATA_CACHE = Path.home() / ".codex" / "codex-chats-metadata-cache.json"
+METADATA_CACHE_VERSION = 1
 _THREAD_SOURCE_CACHE: dict[str, str] | None = None
 _TRANSCRIPT_UPDATED_CACHE: dict[str, float] = {}
 _HISTORY_CACHE: dict[str, tuple[float, str]] | None = None
+_SESSION_METADATA_CACHE: dict | None = None
+_METADATA_CACHE_DIRTY = False
+_METADATA_CACHE_LOCK = threading.RLock()
 
 IS_WINDOWS = sys.platform == "win32"
 
@@ -561,6 +566,48 @@ def _session_visible_last_seen(path: Path, fallback: float, session_id: str | No
     return max(transcript_seen, history_seen)
 
 
+def _load_metadata_cache() -> dict:
+    global _SESSION_METADATA_CACHE
+    with _METADATA_CACHE_LOCK:
+        if _SESSION_METADATA_CACHE is not None:
+            return _SESSION_METADATA_CACHE
+
+        cache = {"version": METADATA_CACHE_VERSION, "sessions": {}}
+        try:
+            with METADATA_CACHE.open("r", encoding="utf-8", errors="replace") as f:
+                loaded = json.load(f)
+            if loaded.get("version") == METADATA_CACHE_VERSION and isinstance(loaded.get("sessions"), dict):
+                cache = loaded
+        except (OSError, json.JSONDecodeError):
+            pass
+
+        _SESSION_METADATA_CACHE = cache
+        return cache
+
+
+def _save_metadata_cache() -> None:
+    global _METADATA_CACHE_DIRTY
+    with _METADATA_CACHE_LOCK:
+        if not _METADATA_CACHE_DIRTY or _SESSION_METADATA_CACHE is None:
+            return
+        try:
+            METADATA_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = METADATA_CACHE.with_suffix(METADATA_CACHE.suffix + ".tmp")
+            with tmp.open("w", encoding="utf-8") as f:
+                json.dump(_SESSION_METADATA_CACHE, f, ensure_ascii=False, separators=(",", ":"))
+            os.replace(tmp, METADATA_CACHE)
+            _METADATA_CACHE_DIRTY = False
+        except OSError:
+            pass
+
+
+def _cache_entry_matches(entry: dict, stat: os.stat_result) -> bool:
+    return (
+        entry.get("size") == stat.st_size
+        and entry.get("mtime_ns") == getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000))
+    )
+
+
 def _parse_session_meta(path: Path):
     try:
         with path.open("r", errors="replace") as f:
@@ -645,18 +692,16 @@ def _display_path(path: str) -> str:
     return path
 
 
-def parse_one_chat(path: Path) -> dict | None:
-    try:
-        stat = path.stat()
-    except OSError:
-        return None
+def _parse_one_chat_uncached(path: Path, stat: os.stat_result | None = None) -> dict | None:
+    if stat is None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
     size = stat.st_size
     meta = _parse_session_meta(path)
     session_id = (meta or {}).get("id") or _session_id_from_path(path) or ""
     transcript_mtime = _session_transcript_last_seen(path, stat.st_mtime)
-    history_mtime, history_text = _load_history_latest().get(session_id, (0, ""))
-    history_only_latest = history_mtime > transcript_mtime + 1
-    mtime = max(transcript_mtime, history_mtime)
     cwd = (meta or {}).get("cwd") or ""
     timestamp = (meta or {}).get("timestamp") or ""
 
@@ -700,11 +745,6 @@ def parse_one_chat(path: Path) -> dict | None:
     if first_user_msg and len(first_user_msg) > 120:
         first_user_msg = first_user_msg[:117] + "..."
 
-    if history_only_latest:
-        first_user_msg = history_text.replace("\n", " ").strip()
-        if len(first_user_msg) > 120:
-            first_user_msg = first_user_msg[:117] + "..."
-
     truly_empty = False
     if not first_user_msg:
         first_user_msg = "(resumed session)" if has_assistant else "(empty session)"
@@ -726,12 +766,60 @@ def parse_one_chat(path: Path) -> dict | None:
         "message": first_user_msg,
         "truly_empty": truly_empty,
         "timestamp": timestamp or "0",
-        "mtime": mtime,
+        "mtime": transcript_mtime,
+        "transcript_mtime": transcript_mtime,
         "session_id": session_id,
         "cwd": cwd,
         "system_only": system_only,
-        "history_only_latest": history_only_latest,
+        "history_only_latest": False,
     }
+
+
+def _apply_history_overlay(chat: dict) -> dict:
+    session_id = chat.get("session_id") or ""
+    transcript_mtime = float(chat.get("transcript_mtime") or chat.get("mtime") or 0)
+    history_mtime, history_text = _load_history_latest().get(session_id, (0, ""))
+    chat = dict(chat)
+    chat["history_only_latest"] = history_mtime > transcript_mtime + 1
+    chat["mtime"] = max(transcript_mtime, history_mtime)
+    if chat["history_only_latest"]:
+        msg = history_text.replace("\n", " ").strip()
+        chat["message"] = msg[:117] + "..." if len(msg) > 120 else msg
+    return chat
+
+
+def parse_one_chat(path: Path) -> dict | None:
+    global _METADATA_CACHE_DIRTY
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+
+    cache = _load_metadata_cache()
+    cache_key = str(path)
+    with _METADATA_CACHE_LOCK:
+        sessions = cache.setdefault("sessions", {})
+        entry = sessions.get(cache_key)
+        if isinstance(entry, dict) and _cache_entry_matches(entry, stat):
+            chat = entry.get("chat")
+            if isinstance(chat, dict):
+                return _apply_history_overlay(chat)
+
+    chat = _parse_one_chat_uncached(path, stat)
+    with _METADATA_CACHE_LOCK:
+        sessions = cache.setdefault("sessions", {})
+        if chat is None:
+            sessions.pop(cache_key, None)
+            _METADATA_CACHE_DIRTY = True
+            return None
+
+        sessions[cache_key] = {
+            "size": stat.st_size,
+            "mtime_ns": getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1_000_000_000)),
+            "chat": chat,
+        }
+        _METADATA_CACHE_DIRTY = True
+    return _apply_history_overlay(chat)
 
 
 def _is_system_only_session(path: Path) -> bool:
@@ -770,24 +858,15 @@ def list_projects():
     projects = {}
     newest = {}
     for path in SESSION_ROOT.rglob("rollout-*.jsonl"):
-        if _is_system_only_session(path):
+        chat = parse_one_chat(path)
+        if not chat or chat.get("system_only"):
             continue
-        meta = _parse_session_meta(path)
-        if not meta:
+        if _is_subagent_thread(chat.get("session_id") or _session_id_from_path(path)):
             continue
-        if _is_subagent_thread(meta.get("id") or _session_id_from_path(path)):
-            continue
-        cwd = meta.get("cwd") or str(Path.home())
+        cwd = chat.get("cwd") or str(Path.home())
         projects[cwd] = projects.get(cwd, 0) + 1
-        try:
-            stat = path.stat()
-        except OSError:
-            last_seen = 0
-        else:
-            last_seen = _session_visible_last_seen(
-                path, stat.st_mtime, meta.get("id") or _session_id_from_path(path)
-            )
-        newest[cwd] = max(newest.get(cwd, 0), last_seen)
+        newest[cwd] = max(newest.get(cwd, 0), float(chat.get("mtime") or 0))
+    _save_metadata_cache()
     items = []
     for cwd, count in projects.items():
         missing = not os.path.isdir(cwd)
@@ -802,27 +881,23 @@ def usage_check():
     total_bytes = 0
 
     for path in SESSION_ROOT.rglob("rollout-*.jsonl"):
-        if _is_system_only_session(path):
+        chat = parse_one_chat(path)
+        if not chat or chat.get("system_only"):
             continue
-        meta = _parse_session_meta(path)
-        if not meta:
+        if _is_subagent_thread(chat.get("session_id") or _session_id_from_path(path)):
             continue
-        if _is_subagent_thread(meta.get("id") or _session_id_from_path(path)):
-            continue
-        cwd = meta.get("cwd") or str(Path.home())
+        cwd = chat.get("cwd") or str(Path.home())
         try:
             stat = path.stat()
         except OSError:
             continue
-        last_seen = _session_visible_last_seen(
-            path, stat.st_mtime, meta.get("id") or _session_id_from_path(path)
-        )
         entry = projects.setdefault(cwd, {"count": 0, "size": 0, "newest": 0.0})
         entry["count"] += 1
         entry["size"] += stat.st_size
-        entry["newest"] = max(entry["newest"], last_seen)
+        entry["newest"] = max(entry["newest"], float(chat.get("mtime") or 0))
         total_chats += 1
         total_bytes += stat.st_size
+    _save_metadata_cache()
 
     if not projects:
         print("No Codex sessions found.")
@@ -881,19 +956,18 @@ def fmt_project_line(name, count, max_name_len, missing=False):
 
 
 def load_chats(project_cwd: str):
-    files = []
-    for path in SESSION_ROOT.rglob("rollout-*.jsonl"):
-        meta = _parse_session_meta(path)
-        if not meta or meta.get("cwd") != project_cwd:
-            continue
-        if _is_subagent_thread(meta.get("id") or _session_id_from_path(path)):
-            continue
-        files.append(path)
-    if not files:
-        return []
     with ThreadPoolExecutor(max_workers=8) as pool:
-        results = pool.map(parse_one_chat, files)
-    chats = [r for r in results if r is not None and not r.get("system_only")]
+        results = pool.map(parse_one_chat, SESSION_ROOT.rglob("rollout-*.jsonl"))
+    chats = []
+    for chat in results:
+        if not chat or chat.get("system_only"):
+            continue
+        if chat.get("cwd") != project_cwd:
+            continue
+        if _is_subagent_thread(chat.get("session_id")):
+            continue
+        chats.append(chat)
+    _save_metadata_cache()
     return chats
 
 
